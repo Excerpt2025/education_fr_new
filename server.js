@@ -55,7 +55,7 @@ const PORT = process.env.PORT || 5000;
 const NODE_ENV = process.env.NODE_ENV || 'development';
 const JWT_SECRET = process.env.JWT_SECRET || 'dev_only_change_me';
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '7d';
-const MONGO_URI = process.env.MONGO_URI || 'mongodb+srv://mmc360development_db_user:BeEwtIZqwOJecj28@education-consultancy-p.hkvmaka.mongodb.net/';
+const MONGO_URI = process.env.MONGO_URI 
 
 // Connection pool sizing - tune via .env as traffic grows. Mongoose/MongoDB driver
 // reuses this pool for every request, so we do NOT open a new connection per request.
@@ -111,6 +111,37 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage, limits: { fileSize: 5 * 1024 * 1024 } });
 
+/* ---- KYC documents: stored privately, never under /uploads ---- */
+const kycDir = path.join(__dirname, 'private-uploads', 'kyc');
+if (!fs.existsSync(kycDir)) fs.mkdirSync(kycDir, { recursive: true });
+
+const KYC_DOC_TYPES = ['passbook', 'panCard', 'aadhaarCard'];
+const KYC_DOC_LABELS = { passbook: 'bank passbook', panCard: 'PAN card', aadhaarCard: 'Aadhaar card' };
+const KYC_MIME_EXT = { 'image/jpeg': '.jpg', 'image/png': '.png', 'image/webp': '.webp', 'application/pdf': '.pdf' };
+
+const kycUpload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, kycDir),
+    filename: (req, file, cb) => {
+      // extension comes from the checked mime type, not from the user's file name
+      cb(null, `${req.user.id}-${file.fieldname}-${Date.now()}${KYC_MIME_EXT[file.mimetype]}`);
+    },
+  }),
+  limits: { fileSize: 5 * 1024 * 1024, files: 3 },
+  fileFilter: (req, file, cb) => {
+    if (KYC_MIME_EXT[file.mimetype]) return cb(null, true);
+    cb(new Error('Only JPG, PNG, WEBP or PDF files are allowed'));
+  },
+}).fields(KYC_DOC_TYPES.map((name) => ({ name, maxCount: 1 })));
+
+function runKycUpload(req, res, next) {
+  kycUpload(req, res, (err) => {
+    if (!err) return next();
+    const message = err.code === 'LIMIT_FILE_SIZE' ? 'Each file must be 5 MB or smaller' : err.message;
+    res.status(400).json({ success: false, message });
+  });
+}
+
 
 const Razorpay = require('razorpay');
 const crypto = require('crypto');
@@ -129,7 +160,7 @@ mongoose
     minPoolSize: DB_MIN_POOL_SIZE,
     serverSelectionTimeoutMS: 8000,
   })
-  .then(() => console.log(`[MongoDB] connected -> ${MONGO_URI} (pool ${DB_MIN_POOL_SIZE}-${DB_MAX_POOL_SIZE})`))
+  .then(() => console.log(`[MongoDB] connected ->  (pool ${DB_MIN_POOL_SIZE}-${DB_MAX_POOL_SIZE})`))
   .catch((err) => console.error('[MongoDB] connection error:', err.message));
 
 mongoose.set('strictQuery', true);
@@ -164,6 +195,13 @@ const studentSchema = new Schema({
     submittedAt: { type: Date },
     verifiedAt: { type: Date },
     rejectionReason: { type: String, default: '' },
+        // Private file names (stored in /private-uploads/kyc, never served publicly)
+    documents: {
+      passbook: { type: String, default: '' },
+      panCard: { type: String, default: '' },
+      aadhaarCard: { type: String, default: '' },
+    },
+    reviewedBy: { type: Schema.Types.ObjectId, ref: 'Admin' },
   },
   resetToken: { type: String },
   resetTokenExpiry: { type: Date },
@@ -320,9 +358,45 @@ assessmentResultSchema.index({ student: 1, createdAt: -1 });
 
 const AssessmentResult = model('AssessmentResult', assessmentResultSchema);
 
+// ---- Promo Codes ----
+const promoCodeSchema = new Schema({
+  code: { type: String, required: true, unique: true, uppercase: true, trim: true },
+  description: { type: String, default: '' },
+  discountType: { type: String, enum: ['percent', 'flat'], required: true },
+  discountValue: { type: Number, required: true, min: 0 },
+  maxDiscount: { type: Number, default: 0 },           // cap for percent codes, 0 = no cap
+  applicablePlans: [{ type: Schema.Types.ObjectId, ref: 'SubscriptionPlan' }], // empty = all plans
+  usageLimit: { type: Number, default: 0 },            // total redemptions, 0 = unlimited
+  usedCount: { type: Number, default: 0 },
+  perStudentLimit: { type: Number, default: 1 },       // 0 = unlimited per student
+  validFrom: { type: Date },
+  validUntil: { type: Date },
+  isActive: { type: Boolean, default: true },
+}, { timestamps: true });
+
+const PromoCode = model('PromoCode', promoCodeSchema);
+
+const promoRedemptionSchema = new Schema({
+  promo: { type: Schema.Types.ObjectId, ref: 'PromoCode', required: true },
+  student: { type: Schema.Types.ObjectId, ref: 'Student', required: true },
+  payment: { type: Schema.Types.ObjectId, ref: 'Payment' },
+}, { timestamps: true });
+promoRedemptionSchema.index({ promo: 1, student: 1 });
+
+const PromoRedemption = model('PromoRedemption', promoRedemptionSchema);
+
+
+
+
 // ---- Payments ----
 const paymentSchema = new Schema({
   student: { type: Schema.Types.ObjectId, ref: 'Student', required: true },
+
+    plan: { type: Schema.Types.ObjectId, ref: 'SubscriptionPlan' },
+  promo: { type: Schema.Types.ObjectId, ref: 'PromoCode' },
+  promoCode: { type: String, default: '' },
+  originalAmount: { type: Number },
+  discountAmount: { type: Number, default: 0 },
   // find this in paymentSchema and update it:
 purpose: { type: String, enum: ['assessment', 'subscription', 'predictor', 'other'], required: true },
   amount: { type: Number, required: true },
@@ -405,6 +479,14 @@ const collegeSchema = new Schema({
   accreditations: [{ type: String }],
   // Specializations / streams offered, e.g. ["Marketing", "Finance", "HR", "Operations", "Analytics"]
   specializations: [{ type: String }],
+    // Programs ticked in admin, e.g. ["B.E.", "MBA", "PGDM"]
+  programs: [{ type: String }],
+  // collegeSchema.index({ programs: 1 });
+
+    // Bangalore zone for the "Area" filter
+  area: { type: String, enum: ['', 'North', 'South', 'East', 'West', 'Central'], default: '' },
+  // Study modes offered - powers the Full Time / Part Time / Online filter
+  courseTypes: [{ type: String, enum: ['Full Time', 'Part Time', 'Online'] }],
 
   coursesOffered: [{ type: Schema.Types.ObjectId, ref: 'Course' }],
 
@@ -445,6 +527,7 @@ collegeSchema.index({ name: 1 });
 collegeSchema.index({ type: 1 });
 collegeSchema.index({ location: 1 });
 collegeSchema.index({ specializations: 1 });
+collegeSchema.index({ programs: 1 }); 
 collegeSchema.index({ featured: 1, ranking: 1 });
 
 const College = model('College', collegeSchema);
@@ -636,6 +719,71 @@ async function getActiveSubscription(studentId) {
     .populate('plan', 'name price durationInDays')
     .lean();
 }
+
+
+/* ---------------- PROMO HELPERS ---------------- */
+// Same rounding rule as the frontend: whole rupees, ₹1 floor unless fully free.
+function applyDiscount(price, promo) {
+  let discount = promo.discountType === 'percent'
+    ? (price * promo.discountValue) / 100
+    : promo.discountValue;
+  if (promo.maxDiscount > 0) discount = Math.min(discount, promo.maxDiscount);
+  const raw = Math.max(0, price - discount);
+  if (raw === 0) return 0;
+  return Math.max(1, Math.round(raw));
+}
+
+// Returns { ok, message, promo, finalPrice, discount }
+async function checkPromo(rawCode, plan, studentId) {
+  const code = String(rawCode || '').trim().toUpperCase();
+  if (!code) return { ok: false, message: 'Enter a promo code first.' };
+
+  const promo = await PromoCode.findOne({ code, isActive: true });
+  if (!promo) return { ok: false, message: 'Invalid or expired promo code.' };
+
+  const now = new Date();
+  if (promo.validFrom && now < promo.validFrom) return { ok: false, message: 'This promo code is not active yet.' };
+  if (promo.validUntil && now > promo.validUntil) return { ok: false, message: 'This promo code has expired.' };
+  if (promo.usageLimit > 0 && promo.usedCount >= promo.usageLimit) {
+    return { ok: false, message: 'This promo code has been fully redeemed.' };
+  }
+  if (plan && promo.applicablePlans.length && !promo.applicablePlans.some((id) => String(id) === String(plan._id))) {
+    return { ok: false, message: 'This promo code is not valid for the selected plan.' };
+  }
+  if (studentId && promo.perStudentLimit > 0) {
+    const used = await PromoRedemption.countDocuments({ promo: promo._id, student: studentId });
+    if (used >= promo.perStudentLimit) return { ok: false, message: 'You have already used this promo code.' };
+  }
+
+  const finalPrice = plan ? applyDiscount(plan.price, promo) : null;
+  return { ok: true, promo, finalPrice, discount: plan ? plan.price - finalPrice : 0 };
+}
+
+// Atomic: only increments if the usage limit still has room.
+async function redeemPromo(promoId, studentId, paymentId) {
+  const r = await PromoCode.updateOne(
+    { _id: promoId, $or: [{ usageLimit: 0 }, { $expr: { $lt: ['$usedCount', '$usageLimit'] } }] },
+    { $inc: { usedCount: 1 } }
+  );
+  if (!r.modifiedCount) return false;
+  await PromoRedemption.create({ promo: promoId, student: studentId, payment: paymentId });
+  return true;
+}
+
+async function activateSubscription(payment, plan) {
+  const endDate = new Date(Date.now() + plan.durationInDays * 24 * 60 * 60 * 1000);
+  const sub = await Subscription.create({
+    student: payment.student, plan: plan._id, endDate, amountPaid: payment.amount, paymentId: payment._id,
+  });
+  await Referral.updateMany(
+    { referredStudent: payment.student, type: 'subscription', status: 'pending' },
+    { status: 'converted' }
+  );
+  return sub;
+}
+
+
+
 
 /* ----------------------------------------------------------------------------
  *  PAGINATION HELPER
@@ -1091,19 +1239,27 @@ const KEA_PDF_NOISE_PATTERNS = [
   /ALLOTMENT CUT-OFF RANKS/i,
   /^Seat Type:/i,
 ];
+// Footer fragments that pdftotext glues onto other lines at page breaks
+const KEA_GENERATED_RE = /Generated on:\s*[\d-]+\s+[\d:]+/gi;
+const KEA_PAGE_RE = /\bPage\s*(\d+\s*)?of(\s*\d+)?/gi;
 const KEA_COLLEGE_RE = /^College:\s*(\S+)\s+(.*)$/;
 const KEA_HEADER_RE = /^Course Name\s+(.*)$/;
 const KEA_VALUE_TOKEN_RE = /^(--|\d+(\.\d+)?)$/;
 
 function cleanKeaCourseName(raw) {
   return raw
+    .replace(/Generated on:.*$/i, '')   // safety net: cut any leaked footer/college text
+    .replace(/College:.*$/i, '')
     .replace(/\s+/g, ' ')
-    .replace(/\s+(\d{1,2})\s+/g, ' ') // strip stray footnote-marker digits KEA sometimes embeds mid-name
+    .replace(/\s+(\d{1,2})\s+/g, ' ')
     .trim();
 }
 
 function parseKeaCutoffPdfText(text) {
-  const lines = text.split(/\r?\n/).filter((ln) => !KEA_PDF_NOISE_PATTERNS.some((re) => re.test(ln)));
+  const lines = text
+    .split(/\r?\n/)
+    .map((ln) => ln.replace(KEA_GENERATED_RE, ' ').replace(KEA_PAGE_RE, ' ').trim()) // trim leading spaces so ^College: matches
+    .filter((ln) => ln && !KEA_PDF_NOISE_PATTERNS.some((re) => re.test(ln)));
 
   const rows = [];
   let currentCollege = null;
@@ -1376,7 +1532,9 @@ app.get('/api/students/me', authRequired, async (req, res) => {
 
 app.put('/api/students/me', authRequired, upload.single('profilePhoto'), async (req, res) => {
   if (req.user.role !== 'student') return res.status(403).json({ success: false, message: 'Students only' });
-  const updates = { ...req.body };
+  const allowed = ['fullName', 'phone', 'gender', 'dob', 'address'];
+  const updates = {};
+  allowed.forEach((k) => { if (req.body[k] !== undefined) updates[k] = req.body[k]; });
   if (req.file) updates.profilePhoto = '/uploads/' + req.file.filename;
   const student = await Student.findByIdAndUpdate(req.user.id, updates, { new: true });
   res.json({ success: true, student: sanitizeStudent(student) });
@@ -1384,30 +1542,71 @@ app.put('/api/students/me', authRequired, upload.single('profilePhoto'), async (
 
 // KYC (bank/UPI details) — required before referral earnings can be paid out.
 // Submitting always resets status to "pending" so admin re-reviews any change.
-app.put('/api/students/kyc', authRequired, validate({
-  accountHolderName: { required: true, minLength: 2 },
-  bankName: { required: true, minLength: 2 },
-  accountNumber: { required: true, minLength: 6 },
-  ifsc: { required: true, minLength: 6 },
-  panNumber: { required: true, minLength: 10 },
-}), async (req, res) => {
-  if (req.user.role !== 'student') return res.status(403).json({ success: false, message: 'Students only' });
-  const { accountHolderName, bankName, accountNumber, ifsc, panNumber, upiId } = req.body;
-  const student = await Student.findByIdAndUpdate(req.user.id, {
-    kyc: {
-      accountHolderName: String(accountHolderName).trim(),
-      bankName: String(bankName).trim(),
-      accountNumber: String(accountNumber).trim(),
-      ifsc: String(ifsc).trim().toUpperCase(),
-      panNumber: String(panNumber).trim().toUpperCase(),
-      upiId: (upiId || '').trim(),
-      status: 'pending',
-      submittedAt: new Date(),
-      verifiedAt: null,
-      rejectionReason: '',
-    },
-  }, { new: true });
-  res.json({ success: true, student: sanitizeStudent(student) });
+app.put('/api/students/kyc', authRequired, runKycUpload, async (req, res) => {
+  const uploaded = Object.values(req.files || {}).flat();
+  console.log('[KYC] files received:', Object.keys(req.files || {}), 'dir:', kycDir);
+  const discard = () => uploaded.forEach((f) => fs.unlink(f.path, () => {}));
+  try {
+    if (req.user.role !== 'student') { discard(); return res.status(403).json({ success: false, message: 'Students only' }); }
+
+    const errors = validateBody(req.body, {
+      accountHolderName: { required: true, minLength: 2 },
+      bankName: { required: true, minLength: 2 },
+      accountNumber: { required: true, minLength: 6 },
+      ifsc: { required: true, minLength: 6 },
+      panNumber: { required: true, minLength: 10 },
+    });
+    const ifsc = String(req.body.ifsc || '').trim().toUpperCase();
+    const pan = String(req.body.panNumber || '').trim().toUpperCase();
+    if (!errors.length && !/^[A-Z]{4}0[A-Z0-9]{6}$/.test(ifsc)) errors.push('Enter a valid 11-character IFSC code');
+    if (!errors.length && !/^[A-Z]{5}[0-9]{4}[A-Z]$/.test(pan)) errors.push('Enter a valid 10-character PAN');
+  if (errors.length) {
+  discard();
+  console.log('[KYC] rejected:', errors, 'body keys:', Object.keys(req.body));
+  return res.status(400).json({ success: false, message: errors.join('. '), errors });
+}
+
+    // Every document must exist: either freshly uploaded now, or already on file from before.
+    const existing = await Student.findById(req.user.id).select('kyc.documents').lean();
+    const oldDocs = existing?.kyc?.documents || {};
+    const docs = { passbook: oldDocs.passbook || '', panCard: oldDocs.panCard || '', aadhaarCard: oldDocs.aadhaarCard || '' };
+    const replaced = [];
+    for (const type of KYC_DOC_TYPES) {
+      const file = req.files?.[type]?.[0];
+      if (file) {
+        if (docs[type]) replaced.push(docs[type]);
+        docs[type] = file.filename;
+      } else if (!docs[type]) {
+        discard();
+        return res.status(400).json({ success: false, message: `Please upload your ${KYC_DOC_LABELS[type]}` });
+      }
+    }
+
+    const student = await Student.findByIdAndUpdate(req.user.id, {
+      kyc: {
+        accountHolderName: String(req.body.accountHolderName).trim(),
+        bankName: String(req.body.bankName).trim(),
+        accountNumber: String(req.body.accountNumber).trim(),
+        ifsc,
+        panNumber: pan,
+        upiId: (req.body.upiId || '').trim(),
+        documents: docs,
+        status: 'pending',
+        submittedAt: new Date(),
+        verifiedAt: null,
+        rejectionReason: '',
+      },
+    }, { new: true });
+
+    // remove files that were replaced by new uploads
+    replaced.forEach((name) => fs.unlink(path.join(kycDir, path.basename(name)), () => {}));
+    res.json({ success: true, student: sanitizeStudent(student) });
+  } catch (err) {
+  discard();
+  console.error('[KYC submit failed]', err);
+  const status = err.name === 'ValidationError' || err.name === 'CastError' ? 400 : 500;
+  res.status(status).json({ success: false, message: err.message });
+}
 });
 
 function sanitizeStudent(s) {
@@ -1415,6 +1614,12 @@ function sanitizeStudent(s) {
   delete obj.password;
   delete obj.resetToken;
   delete obj.resetTokenExpiry;
+  if (obj.kyc) {
+    const d = obj.kyc.documents || {};
+    // the student only needs to know which documents are on file
+    obj.kyc.documents = { passbook: !!d.passbook, panCard: !!d.panCard, aadhaarCard: !!d.aadhaarCard };
+    delete obj.kyc.reviewedBy;
+  }
   return obj;
 }
 
@@ -1491,20 +1696,50 @@ app.get('/api/subscriptions/status', authRequired, async (req, res) => {
 app.post('/api/subscriptions/purchase', authRequired, validate({ planId: { required: true } }), async (req, res) => {
   try {
     if (req.user.role !== 'student') return res.status(403).json({ success: false, message: 'Students only' });
-    const { planId, referralCode } = req.body;
+    const { planId, referralCode, promoCode } = req.body;
     const plan = await SubscriptionPlan.findById(planId).lean();
     if (!plan) return res.status(404).json({ success: false, message: 'Plan not found' });
 
+    let promo = null;
+    let finalPrice = plan.price;
+    if (promoCode) {
+      const check = await checkPromo(promoCode, plan, req.user.id);
+      if (!check.ok) return res.status(400).json({ success: false, message: check.message });
+      promo = check.promo;
+      finalPrice = check.finalPrice;
+    }
+
+    const promoFields = promo
+      ? { promo: promo._id, promoCode: promo.code, originalAmount: plan.price, discountAmount: plan.price - finalPrice }
+      : {};
+
+    // ---- 100% discount: no gateway, activate immediately ----
+    if (finalPrice === 0) {
+      const payment = await Payment.create({
+        student: req.user.id, purpose: 'subscription', plan: plan._id, amount: 0,
+        gateway: 'razorpay', gatewayPaymentId: 'PROMO-FREE',
+        status: 'success', invoiceNumber: makeInvoiceNumber(), ...promoFields,
+      });
+      const redeemed = await redeemPromo(promo._id, req.user.id, payment._id);
+      if (!redeemed) {
+        await Payment.findByIdAndDelete(payment._id);
+        return res.status(400).json({ success: false, message: 'This promo code has been fully redeemed.' });
+      }
+      const subscription = await activateSubscription(payment, plan);
+      return res.json({ success: true, free: true, payment, plan, subscription, amount: 0 });
+    }
+
+    // ---- Normal paid flow ----
     const rzpOrder = await razorpay.orders.create({
-      amount: plan.price * 100, // paise
+      amount: finalPrice * 100, // paise
       currency: 'INR',
       receipt: makeInvoiceNumber(),
     });
 
     const payment = await Payment.create({
-      student: req.user.id, purpose: 'subscription', amount: plan.price,
+      student: req.user.id, purpose: 'subscription', plan: plan._id, amount: finalPrice,
       gateway: 'razorpay', gatewayOrderId: rzpOrder.id,
-      status: 'created', invoiceNumber: rzpOrder.receipt,
+      status: 'created', invoiceNumber: rzpOrder.receipt, ...promoFields,
     });
 
     res.json({
@@ -1525,7 +1760,6 @@ app.post('/api/subscriptions/purchase', authRequired, validate({ planId: { requi
       }
     }
   } catch (err) {
-    // Razorpay SDK errors are nested - log the real cause, not just err.message
     console.error('[Razorpay order.create failed - subscriptions/purchase]', err.error || err);
     res.status(500).json({
       success: false,
@@ -1533,34 +1767,72 @@ app.post('/api/subscriptions/purchase', authRequired, validate({ planId: { requi
     });
   }
 });
+app.post('/api/promo-codes/validate', async (req, res) => {
+  try {
+    let studentId;
+    const header = req.headers.authorization || '';
+    const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+    if (token) {
+      try { studentId = jwt.verify(token, JWT_SECRET).id; } catch { /* guest */ }
+    }
+
+    const check = await checkPromo(req.body.code, null, studentId);
+    if (!check.ok) return res.json({ success: true, valid: false, message: check.message });
+
+    const p = check.promo;
+    res.json({
+      success: true,
+      valid: true,
+      code: p.code,
+      discountType: p.discountType,
+      discountValue: p.discountValue,
+      maxDiscount: p.maxDiscount || 0,
+      applicablePlans: p.applicablePlans.map(String),
+      message: `Promo code ${p.code} applied.`,
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, valid: false, message: 'Could not validate promo code' });
+  }
+});
+
+
+
 
 // Confirm payment (called after gateway success callback) -> activates subscription
 app.post('/api/payments/verify', async (req, res) => {
   try {
-    const { paymentId, razorpay_order_id, razorpay_payment_id, razorpay_signature, planId } = req.body;
+    const { paymentId, razorpay_order_id, razorpay_payment_id, razorpay_signature } = req.body;
+
+    const payment = await Payment.findById(paymentId);
+    if (!payment) return res.status(404).json({ success: false, message: 'Payment not found' });
+    if (payment.gatewayOrderId !== razorpay_order_id) {
+      return res.status(400).json({ success: false, message: 'Payment verification failed' });
+    }
 
     const expectedSignature = crypto
       .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
       .update(razorpay_order_id + '|' + razorpay_payment_id)
       .digest('hex');
-
     if (expectedSignature !== razorpay_signature) {
       return res.status(400).json({ success: false, message: 'Payment verification failed' });
     }
 
-    const payment = await Payment.findById(paymentId);
-    if (!payment) return res.status(404).json({ success: false, message: 'Payment not found' });
+    // Idempotent: a repeated call must not create a second subscription
+    if (payment.status === 'success') return res.json({ success: true, payment });
+
     payment.status = 'success';
     payment.gatewayPaymentId = razorpay_payment_id;
     await payment.save();
 
-    if (payment.purpose === 'subscription' && planId) {
-      const plan = await SubscriptionPlan.findById(planId);
-      const endDate = new Date(Date.now() + plan.durationInDays * 24 * 60 * 60 * 1000);
-      const sub = await Subscription.create({
-        student: payment.student, plan: plan._id, endDate, amountPaid: payment.amount, paymentId: payment._id,
-      });
-      await Referral.updateMany({ referredStudent: payment.student, type: 'subscription', status: 'pending' }, { status: 'converted' });
+    if (payment.promo) {
+      const ok = await redeemPromo(payment.promo, payment.student, payment._id);
+      if (!ok) console.warn('[Promo] limit reached during checkout race for payment', String(payment._id));
+      // customer already paid, so the subscription is still activated
+    }
+
+    if (payment.purpose === 'subscription' && payment.plan) {
+      const plan = await SubscriptionPlan.findById(payment.plan);
+      const sub = await activateSubscription(payment, plan);
       return res.json({ success: true, payment, subscription: sub });
     }
 
@@ -1568,6 +1840,48 @@ app.post('/api/payments/verify', async (req, res) => {
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
+}); 
+
+
+/* ---- Manage Promo Codes ---- */
+app.get('/api/admin/promo-codes', adminOnly, async (req, res) => {
+  const { page, limit, skip } = getPagination(req);
+  const [codes, total] = await Promise.all([
+    PromoCode.find().populate('applicablePlans', 'name').sort({ createdAt: -1 }).skip(skip).limit(limit).lean(),
+    PromoCode.countDocuments(),
+  ]);
+  paginatedResponse(res, { data: codes, total, page, limit, extraKey: 'promoCodes' });
+});
+
+app.post('/api/admin/promo-codes', adminOnly, validate({
+  code: { required: true, minLength: 3 },
+  discountType: { required: true, enum: ['percent', 'flat'] },
+  discountValue: { required: true, type: 'number', min: 0 },
+}), async (req, res) => {
+  try {
+    const body = { ...req.body, code: String(req.body.code).trim().toUpperCase() };
+    if (body.discountType === 'percent' && Number(body.discountValue) > 100) {
+      return res.status(400).json({ success: false, message: 'Percent discount cannot exceed 100' });
+    }
+    const promo = await PromoCode.create(body);
+    res.status(201).json({ success: true, promo });
+  } catch (err) {
+    const dup = err.code === 11000;
+    res.status(dup ? 409 : 400).json({ success: false, message: dup ? 'That code already exists' : err.message });
+  }
+});
+
+app.put('/api/admin/promo-codes/:id', adminOnly, async (req, res) => {
+  const updates = { ...req.body };
+  delete updates.usedCount;
+  if (updates.code) updates.code = String(updates.code).trim().toUpperCase();
+  const promo = await PromoCode.findByIdAndUpdate(req.params.id, updates, { new: true, runValidators: true });
+  res.json({ success: true, promo });
+});
+
+app.delete('/api/admin/promo-codes/:id', adminOnly, async (req, res) => {
+  await PromoCode.findByIdAndDelete(req.params.id);
+  res.json({ success: true, message: 'Promo code deleted' });
 });
 
 /* ============================================================================
@@ -1778,14 +2092,26 @@ app.get('/api/kcet-cutoffs/meta', cached('kcet-meta', async (req, res) => {
     KcetCutoff.distinct('year'),
     KcetCutoff.distinct('course'),
   ]);
-  const courses = await Course.find({ _id: { $in: courseIds } }).select('name').sort({ name: 1 }).lean();
-  res.set('Cache-Control', 'public, max-age=300');
-  res.json({
-    success: true,
-    categories: categories.sort(),
-    years: years.sort((a, b) => b - a),
-    courses: courses.map((c) => ({ id: c._id, name: c.name })),
-  });
+const courses = await Course.find({
+  _id: { $in: courseIds },
+  name: { $not: /Generated on|College:|Page\s+of/i },
+}).select('name').sort({ name: 1 }).lean();
+
+// de-duplicate identical names
+const seen = new Set();
+const uniqueCourses = courses.filter((c) => {
+  const k = c.name.toLowerCase();
+  if (seen.has(k)) return false;
+  seen.add(k);
+  return true;
+});
+
+res.json({
+  success: true,
+  categories: categories.sort(),
+  years: years.sort((a, b) => b - a),
+  courses: uniqueCourses.map((c) => ({ id: c._id, name: c.name })),
+});
 }));
 
 app.post('/api/predictors/kcet', validate({
@@ -2290,6 +2616,7 @@ app.get('/api/admin/dashboard', adminOnly, async (req, res) => {
     Payment.aggregate([{ $match: { status: 'success' } }, { $group: { _id: null, total: { $sum: '$amount' } } }]),
     Referral.countDocuments({ status: 'pending' }),
     CollegeReferral.countDocuments({ status: 'open' }),
+    Student.countDocuments({ 'kyc.status': 'pending' })
   ]);
   res.json({
     success: true,
@@ -2557,6 +2884,101 @@ app.put('/api/admin/college-interest/:id', adminOnly, async (req, res) => {
   res.json({ success: true, lead });
 });
 
+/* ============================================================================
+ *  ADMIN: KYC VERIFICATION
+ * ==========================================================================*/
+function maskAccount(n) {
+  const s = String(n || '');
+  return s.length > 4 ? '•'.repeat(s.length - 4) + s.slice(-4) : s;
+}
+function docFlags(d = {}) {
+  return { passbook: !!d.passbook, panCard: !!d.panCard, aadhaarCard: !!d.aadhaarCard };
+}
+
+// List: everyone who has submitted KYC. ?status=pending|verified|rejected|all, ?search=
+app.get('/api/admin/kyc', adminOnly, async (req, res) => {
+  const { page, limit, skip } = getPagination(req);
+  const filter = {};
+  if (['pending', 'verified', 'rejected'].includes(req.query.status)) filter['kyc.status'] = req.query.status;
+  else filter['kyc.status'] = { $in: ['pending', 'verified', 'rejected'] };
+  if (req.query.search) {
+    const term = String(req.query.search).slice(0, 60);
+    filter.$or = [
+      { fullName: { $regex: term, $options: 'i' } },
+      { email: { $regex: term, $options: 'i' } },
+      { phone: { $regex: term, $options: 'i' } },
+    ];
+  }
+  const [students, total, pending, verified, rejected] = await Promise.all([
+    Student.find(filter)
+      .select('fullName email phone kyc.status kyc.bankName kyc.accountNumber kyc.submittedAt kyc.documents')
+      .sort({ 'kyc.submittedAt': -1 }).skip(skip).limit(limit).lean(),
+    Student.countDocuments(filter),
+    Student.countDocuments({ 'kyc.status': 'pending' }),
+    Student.countDocuments({ 'kyc.status': 'verified' }),
+    Student.countDocuments({ 'kyc.status': 'rejected' }),
+  ]);
+  res.json({
+    success: true,
+    students: students.map((s) => ({
+      ...s,
+      kyc: { ...s.kyc, accountNumber: maskAccount(s.kyc?.accountNumber), documents: docFlags(s.kyc?.documents) },
+    })),
+    counts: { pending, verified, rejected },
+    pagination: { page, limit, total, totalPages: Math.max(1, Math.ceil(total / limit)) },
+  });
+});
+
+// One submission, with full details (for the review window)
+app.get('/api/admin/kyc/:id', adminOnly, async (req, res) => {
+  if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ success: false, message: 'Invalid id' });
+  const s = await Student.findById(req.params.id).select('fullName email phone kyc').lean();
+  if (!s || !s.kyc || s.kyc.status === 'not_submitted') return res.status(404).json({ success: false, message: 'No KYC submission found' });
+  res.json({ success: true, student: { ...s, kyc: { ...s.kyc, documents: docFlags(s.kyc.documents) } } });
+});
+
+// Stream one private document. Admin token required; never cached.
+app.get('/api/admin/kyc/:id/document/:type', adminOnly, async (req, res) => {
+  const { id, type } = req.params;
+  if (!KYC_DOC_TYPES.includes(type) || !mongoose.isValidObjectId(id)) return res.status(400).json({ success: false, message: 'Invalid request' });
+  const s = await Student.findById(id).select('kyc.documents').lean();
+  const fileName = s?.kyc?.documents?.[type];
+  if (!fileName) return res.status(404).json({ success: false, message: 'Document not uploaded' });
+  const abs = path.join(kycDir, path.basename(fileName));
+  if (!fs.existsSync(abs)) return res.status(404).json({ success: false, message: 'File missing on server' });
+  res.set('Cache-Control', 'private, no-store');
+  res.set('X-Content-Type-Options', 'nosniff');
+  res.sendFile(abs);
+});
+
+// Verify or reject
+app.put('/api/admin/kyc/:id', adminOnly, async (req, res) => {
+  if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ success: false, message: 'Invalid id' });
+  const { action, reason } = req.body;
+  if (!['verify', 'reject'].includes(action)) return res.status(400).json({ success: false, message: 'action must be verify or reject' });
+  if (action === 'reject' && !String(reason || '').trim()) {
+    return res.status(400).json({ success: false, message: 'Please give a reason so the student knows what to fix' });
+  }
+  const s = await Student.findById(req.params.id).select('kyc').lean();
+  if (!s || !s.kyc || s.kyc.status === 'not_submitted') return res.status(404).json({ success: false, message: 'No KYC submission found' });
+  if (action === 'verify') {
+    const d = s.kyc.documents || {};
+    if (!KYC_DOC_TYPES.every((t) => d[t])) return res.status(400).json({ success: false, message: 'All three documents are needed before verifying' });
+  }
+  const student = await Student.findByIdAndUpdate(req.params.id, {
+    $set: {
+      'kyc.status': action === 'verify' ? 'verified' : 'rejected',
+      'kyc.verifiedAt': action === 'verify' ? new Date() : null,
+      'kyc.rejectionReason': action === 'verify' ? '' : String(reason).trim().slice(0, 300),
+      'kyc.reviewedBy': req.user.id,
+    },
+  }, { new: true }).select('fullName kyc.status');
+  res.json({ success: true, student });
+});
+
+
+
+
 /* ---- Manage College Admission Referrals ---- */
 app.get('/api/admin/college-referrals', adminOnly, async (req, res) => {
   const { page, limit, skip } = getPagination(req);
@@ -2798,7 +3220,10 @@ function buildCollegePayload(body, files) {
     rating: body.rating ? Number(body.rating) : 0,
     ranking: body.ranking ? Number(body.ranking) : undefined,
     accreditations: toList(body.accreditations),
-    specializations: toList(body.specializations),
+       specializations: toList(body.specializations),
+    programs: body.programs !== undefined ? toList(body.programs) : undefined,
+        area: body.area !== undefined ? body.area : undefined,
+    courseTypes: body.courseTypes !== undefined ? toList(body.courseTypes) : undefined,
     facilities: toList(body.facilities),
     brochureUrl: body.brochureUrl || '',
     featured: body.featured === 'true' || body.featured === true,
@@ -2860,6 +3285,12 @@ app.delete('/api/admin/courses/:id', adminOnly, async (req, res) => {
   await Course.findByIdAndDelete(req.params.id);
   cacheInvalidate('courses');
   res.json({ success: true, message: 'Course deleted' });
+});
+app.delete('/api/admin/courses/cleanup/dirty', adminOnly, async (req, res) => {
+  const result = await Course.deleteMany({ name: /Generated on|College:|Page\s+of/i });
+  cacheInvalidate('kcet-meta');
+  cacheInvalidate('pgcet-meta');
+  res.json({ success: true, deletedCount: result.deletedCount });
 });
 
 /* ---- Manage Slider / Banners ---- */
